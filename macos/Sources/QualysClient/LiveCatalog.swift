@@ -3,17 +3,31 @@ import Observation
 
 @MainActor @Observable
 final class LiveCatalog {
-    private(set) var findings: [Finding] = []
+    private(set) var findings: [Finding] = [] {
+        didSet { revision += 1 }
+    }
+    private(set) var revision = 0
+    private var didLoad = false
     private(set) var tag: String?
     private(set) var failure: String?
     private(set) var isLoading = false
     private(set) var progress = ""
     private var request: Task<Void, Never>?
 
+    func loadOnce() {
+        guard !didLoad else { return }
+        didLoad = true
+        loadSaved(reportMissingConfiguration: false)
+    }
+
     func refresh() {
+        loadSaved(reportMissingConfiguration: true)
+    }
+
+    private func loadSaved(reportMissingConfiguration: Bool) {
         do {
             guard let api = try ConnectionSettings.savedAPI() else {
-                failure = QualysAPI.Problem.configuration.localizedDescription
+                if reportMissingConfiguration { failure = QualysAPI.Problem.configuration.localizedDescription }
                 return
             }
             load(api)
@@ -29,6 +43,7 @@ final class LiveCatalog {
     }
 
     func load(_ api: QualysAPI, reset: Bool = false) {
+        didLoad = true
         request?.cancel()
         if reset { findings = [] }
         tag = api.tag

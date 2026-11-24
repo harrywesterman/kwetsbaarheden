@@ -7,7 +7,8 @@ struct QualysClientApp: App {
     var body: some Scene {
         WindowGroup("Qualys Client") {
             CatalogView(catalog: catalog)
-                .frame(minWidth: 860, minHeight: 540)
+                .frame(minWidth: 960, minHeight: 540)
+                .task { catalog.loadOnce() }
         }
         .defaultSize(width: 1150, height: 720)
 
@@ -20,21 +21,40 @@ struct QualysClientApp: App {
 struct CatalogView: View {
     let catalog: LiveCatalog
     @State private var query = ""
-    @State private var scope: Int? = 0
+    @State private var scope: Int? = Severity.critical.rawValue
+    @State private var platform: Platform? = .macOS
+    @State private var days = 30
+    @State private var scoped: [Finding] = []
     @State private var product = ""
     @State private var selection: Finding.ID? = nil
     @State private var showsInspector = true
-    @State private var sort = [KeyPathComparator(\Finding.rank, order: .reverse),
+    @State private var sort = [KeyPathComparator(\Finding.timesFound, order: .reverse),
                                KeyPathComparator(\Finding.id)]
 
     private var findings: [Finding] { catalog.findings }
     private var severity: Severity? { Severity(rawValue: scope ?? 0) }
-    private var products: [String] { Set(findings.map(\.product)).sorted() }
+    private var products: [String] {
+        Set(scoped.map(\.product)).union(product.isEmpty ? [] : [product]).sorted()
+    }
+
+    private struct Scope: Equatable {
+        let revision: Int
+        let severity: Severity?
+        let platform: Platform?
+        let days: Int
+    }
+
+    private var currentScope: Scope {
+        Scope(revision: catalog.revision, severity: severity, platform: platform, days: days)
+    }
+
     private var filtered: [Finding] {
         let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
-        return findings.filter {
-            (severity == nil || $0.severity == severity) &&
-            (product.isEmpty || $0.product == product) && $0.matches(terms)
+        return scoped.filter { finding in
+            guard product.isEmpty || finding.product == product else { return false }
+            if terms.isEmpty { return true }
+            let text = finding.searchText
+            return terms.allSatisfy { text.localizedStandardContains($0) }
         }.sorted(using: sort)
     }
 
@@ -112,6 +132,10 @@ struct CatalogView: View {
                     .inspectorColumnWidth(min: 245, ideal: 275, max: 360)
             }
         }
+        .onChange(of: currentScope, initial: true) { _, scope in
+            let since = scope.days > 0 ? Calendar.current.date(byAdding: .day, value: -scope.days, to: .now) : nil
+            scoped = findings.compactMap { $0.scoped(platform: scope.platform, since: since, severity: scope.severity) }
+        }
         .onChange(of: rows.map(\.id)) { _, ids in
             if let selection, !ids.contains(selection) {
                 self.selection = nil
@@ -120,7 +144,7 @@ struct CatalogView: View {
     }
 
     private func catalogHeader(count: Int) -> some View {
-        HStack(alignment: .center) {
+        VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
                 Text(severity?.title ?? "Alle QID’s")
                     .font(.system(size: 29, weight: .semibold))
@@ -129,13 +153,27 @@ struct CatalogView: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            Spacer()
-            Picker("Product", selection: $product) {
-                Text("Alle producten").tag("")
-                ForEach(products, id: \.self) { Text($0).tag($0) }
+            HStack {
+                Picker("Platform", selection: $platform) {
+                    Text("Alle").tag(nil as Platform?)
+                    ForEach(Platform.allCases) { Text($0.rawValue).tag(Optional($0)) }
+                }
+                .fixedSize()
+                Picker("Laatste gezien", selection: $days) {
+                    ForEach([7, 14, 30, 60, 90, 180, 365], id: \.self) { day in
+                        Text("Laatste \(day) dagen").tag(day)
+                    }
+                    Text("Alle datums").tag(0)
+                }
+                .fixedSize()
+                Picker("Product", selection: $product) {
+                    Text("Alle").tag("")
+                    ForEach(products, id: \.self) { Text($0).tag($0) }
+                }
+                .frame(maxWidth: 210)
             }
-            .fixedSize()
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 22)
         .padding(.vertical, 20)
     }
@@ -195,6 +233,10 @@ struct CatalogView: View {
                 .width(min: 145, ideal: 310)
             TableColumn("Product", value: \.product)
                 .width(min: 70, ideal: 105, max: 180)
+            TableColumn("Keren gezien", value: \.timesFound) { finding in
+                Text(finding.timesFound, format: .number).monospacedDigit()
+            }
+            .width(min: 84, ideal: 94, max: 130)
             TableColumn("Ernst", value: \.rank) { finding in
                 Label {
                     Text(finding.severityLabel)
@@ -216,6 +258,8 @@ struct CatalogView: View {
                         query = ""
                         product = ""
                         scope = 0
+                        platform = nil
+                        days = 0
                     }
                 }
             }
@@ -240,6 +284,10 @@ struct CatalogView: View {
                     Divider()
                     LabeledContent("Ernst", value: finding.severityLabel)
                     LabeledContent("Product", value: finding.product)
+                    LabeledContent("Keren gezien", value: finding.timesFound.formatted())
+                    if let date = finding.lastSeen {
+                        LabeledContent("Laatst gezien", value: date.formatted(date: .abbreviated, time: .omitted))
+                    }
                     VStack(alignment: .leading, spacing: 6) {
                         Text("CVE’s").font(.headline)
                         if finding.cves.isEmpty {

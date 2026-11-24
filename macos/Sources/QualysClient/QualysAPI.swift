@@ -28,7 +28,7 @@ struct QualysAPI {
                        "show_igs": "1",
                        "show_results": "0", "truncation_limit": "100"]
         var cursor: Int?
-        var detections: [Int: Int] = [:]
+        var detections: [Int: [QualysDetection]] = [:]
         var pageNumber = 0
         var pageRows: [Finding]?
         repeat {
@@ -46,8 +46,10 @@ struct QualysAPI {
             try Task.checkCancellation()
             let page = try await fetch(session, path: "/api/5.0/fo/asset/host/vm/detection/",
                                        parameters: parameters, root: "HOST_LIST_VM_DETECTION_OUTPUT")
-            detections.merge(page.detections, uniquingKeysWith: max)
-            pageRows = detections.map { Self.detection(id: $0.key, severity: $0.value) }
+            for (id, records) in page.detections {
+                detections[id, default: []].append(contentsOf: records)
+            }
+            pageRows = detections.map { Self.detection(id: $0.key, records: $0.value) }
             if page.hasWarning {
                 guard let link = page.continuation,
                       let query = URLComponents(string: link)?.queryItems,
@@ -62,7 +64,7 @@ struct QualysAPI {
         } while cursor != nil
 
         let ids = detections.keys.sorted()
-        var results = ids.map { Self.detection(id: $0, severity: detections[$0] ?? 0) }
+        var results = ids.map { Self.detection(id: $0, records: detections[$0] ?? []) }
         for start in stride(from: 0, to: ids.count, by: 100) {
             try Task.checkCancellation()
             await progress("Details ophalen · \(start) van \(ids.count) QID’s", results)
@@ -73,15 +75,18 @@ struct QualysAPI {
                                        root: "KNOWLEDGE_BASE_VULN_LIST_OUTPUT")
             guard !page.hasWarning else { throw Problem.pagination }
             for index in batch.indices {
-                if let detail = page.findings[ids[index]] { results[index] = detail }
+                if var detail = page.findings[ids[index]] {
+                    detail.detections = results[index].detections
+                    results[index] = detail
+                }
             }
         }
         return results
     }
 
-    private static func detection(id: Int, severity: Int) -> Finding {
+    private static func detection(id: Int, records: [QualysDetection]) -> Finding {
         Finding(id: id, title: "Titel niet beschikbaar", product: "Onbekend",
-                severity: Severity(rawValue: severity), cves: [])
+                severity: nil, cves: [], detections: records)
     }
 
     private func fetch(_ session: URLSession, path: String, parameters: [String: String],
@@ -144,6 +149,15 @@ private final class QualysXML: NSObject, XMLParserDelegate {
     private var id: Int?
     private var severity: Int?
     private var title = ""
+    private var platform = Platform.unknown
+    private var timesFound = 0
+    private var lastSeen: Date?
+    private let dateFormat = ISO8601DateFormatter()
+    private let fractionalDateFormat: ISO8601DateFormatter = {
+        let format = ISO8601DateFormatter()
+        format.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return format
+    }()
     private var products: Set<String> = []
     private var cves: Set<String> = []
 
@@ -152,7 +166,7 @@ private final class QualysXML: NSObject, XMLParserDelegate {
     private(set) var errorCode: Int?
     private(set) var hasWarning = false
     private(set) var continuation: String?
-    private(set) var detections: [Int: Int] = [:]
+    private(set) var detections: [Int: [QualysDetection]] = [:]
     private(set) var findings: [Int: Finding] = [:]
 
     func parser(_ parser: XMLParser, didStartElement element: String, namespaceURI: String?,
@@ -161,9 +175,12 @@ private final class QualysXML: NSObject, XMLParserDelegate {
         if path.count == 1, element == "RESPONSE" { hasResponse = true }
         path.append(element)
         value = ""
+        if element == "HOST" { platform = .unknown }
         if element == "DETECTION" || element == "VULN" {
             id = nil
             severity = nil
+            timesFound = 0
+            lastSeen = nil
             title = ""
             products.removeAll()
             cves.removeAll()
@@ -180,11 +197,19 @@ private final class QualysXML: NSObject, XMLParserDelegate {
         switch (path.last, element) {
         case ("DETECTION", "QID"), ("VULN", "QID"): id = Int(text)
         case ("DETECTION", "SEVERITY"), ("VULN", "SEVERITY_LEVEL"): severity = Int(text)
+        case ("HOST", "OS"): platform = Platform(os: text)
+        case ("DETECTION", "TIMES_FOUND"): timesFound = max(0, Int(text) ?? 0)
+        case ("DETECTION", "LAST_FOUND_DATETIME"):
+            lastSeen = dateFormat.date(from: text) ?? fractionalDateFormat.date(from: text)
         case ("VULN", "TITLE"): title = text
         case ("SOFTWARE", "PRODUCT"): if !text.isEmpty { products.insert(text) }
         case ("CVE", "ID"): if !text.isEmpty { cves.insert(text) }
         case ("DETECTION_LIST", "DETECTION"):
-            if let id { detections[id] = max(detections[id] ?? 0, severity ?? 0) }
+            if let id {
+                detections[id, default: []].append(QualysDetection(
+                    platform: platform, severity: severity.flatMap(Severity.init(rawValue:)),
+                    timesFound: timesFound, lastSeen: lastSeen))
+            }
         case ("VULN_LIST", "VULN"):
             if let id {
                 findings[id] = Finding(id: id, title: title.isEmpty ? "Titel niet beschikbaar" : title,
