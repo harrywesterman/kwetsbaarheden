@@ -6,9 +6,10 @@
     <key>CFBundleExecutable</key><string>QualysClient</string>
     <key>CFBundleName</key><string>Qualys Client</string>
     <key>CFBundleDisplayName</key><string>Qualys Client</string>
+    <key>CFBundleIconFile</key><string>QualysClient.icns</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.5</string>
-    <key>CFBundleVersion</key><string>5</string>
+    <key>CFBundleShortVersionString</key><string>0.14</string>
+    <key>CFBundleVersion</key><string>14</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>

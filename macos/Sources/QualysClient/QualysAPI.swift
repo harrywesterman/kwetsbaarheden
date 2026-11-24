@@ -13,75 +13,174 @@ struct QualysAPI {
         return parts.url
     }
 
-    func findings(configuration: URLSessionConfiguration = .ephemeral,
-                  progress: @MainActor (String, [Finding]?) -> Void = { _, _ in }) async throws -> [Finding] {
+    func findings(configuration: URLSessionConfiguration = .ephemeral, now: Date = .now,
+                      progress: @MainActor (String, [Finding]?) -> Void) async throws -> [Finding] {
         configuration.urlCache = nil
         configuration.urlCredentialStorage = nil
         configuration.httpShouldSetCookies = false
-        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForRequest = 45
         configuration.timeoutIntervalForResource = 90
         let session = URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
 
-        let filters = ["action": "list", "use_tags": "1", "tag_set_by": "name",
-                       "tag_set_include": tag, "status": "New,Active,Re-Opened,Fixed",
-                       "show_igs": "1",
-                       "show_results": "0", "truncation_limit": "100"]
-        var cursor: Int?
-        var detections: [Int: [QualysDetection]] = [:]
-        var pageNumber = 0
-        var pageRows: [Finding]?
-        repeat {
-            pageNumber += 1
-            let message = pageNumber == 1
-                ? "Wachten op antwoord van Qualys · eerste pagina"
-                : "Detecties ophalen · pagina \(pageNumber) · \(detections.count) unieke QID’s"
-            await progress(message, pageRows)
-            var parameters = filters
-            if let cursor {
-                parameters["id_min"] = String(cursor)
-            } else {
-                parameters["truncation_limit"] = "25"
-            }
-            try Task.checkCancellation()
-            let page = try await fetch(session, path: "/api/5.0/fo/asset/host/vm/detection/",
-                                       parameters: parameters, root: "HOST_LIST_VM_DETECTION_OUTPUT")
-            for (id, records) in page.detections {
-                detections[id, default: []].append(contentsOf: records)
-            }
-            pageRows = detections.map { Self.detection(id: $0.key, records: $0.value) }
-            if page.hasWarning {
-                guard let link = page.continuation,
-                      let query = URLComponents(string: link)?.queryItems,
-                      let value = query.first(where: { $0.name == "id_min" })?.value,
-                      let next = Int(value), next > (cursor ?? 0) else {
-                    throw Problem.pagination
-                }
-                cursor = next
-            } else {
-                cursor = nil
-            }
-        } while cursor != nil
+        let cutoff = Calendar.current.date(byAdding: .day, value: -30, to: now) ?? now
+        let formatter = ISO8601DateFormatter()
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var assets: Set<Int> = []
+        var records: [Int: [QualysDetection]] = [:]
+        var rejected = 0
 
-        let ids = detections.keys.sorted()
-        var results = ids.map { Self.detection(id: $0, records: detections[$0] ?? []) }
-        for start in stride(from: 0, to: ids.count, by: 100) {
-            try Task.checkCancellation()
-            await progress("Details ophalen · \(start) van \(ids.count) QID’s", results)
-            let batch = ids[start..<min(start + 100, ids.count)]
-            let page = try await fetch(session, path: "/api/2.0/fo/knowledge_base/vuln/",
-                                       parameters: ["action": "list", "details": "All",
-                                                    "ids": batch.map(String.init).joined(separator: ",")],
-                                       root: "KNOWLEDGE_BASE_VULN_LIST_OUTPUT")
-            guard !page.hasWarning else { throw Problem.pagination }
-            for index in batch.indices {
-                if var detail = page.findings[ids[index]] {
-                    detail.detections = results[index].detections
-                    results[index] = detail
+        var assetCursor: Int?
+        repeat {
+            await progress("VMDR zoekt Macs met tag \(tag)", nil)
+            let page = try await assetSearch(
+                session, resource: "hostasset", fields: "id,os,tags.list.TagSimple.name",
+                criteria: [("tagName", "EQUALS", tag), ("os", "CONTAINS", "Mac")], cursor: assetCursor)
+            assetCursor = try page.nextCursor(after: assetCursor)
+            var batch: [Int] = []
+            for asset in try page.root.nodes(forXPath: "data/HostAsset") {
+                let names = try asset.nodes(forXPath: "tags/list/TagSimple/name").compactMap(\.stringValue)
+                guard names.contains(tag), Platform(os: Self.field("os", in: asset) ?? "") == .macOS,
+                      let id = Self.field("id", in: asset).flatMap(Int.init), id > 0 else {
+                    rejected += 1
+                    continue
                 }
+                if assets.insert(id).inserted { batch.append(id) }
+            }
+
+            if !batch.isEmpty {
+                let allowed = Set(batch)
+                var detectionCursor: Int?
+                repeat {
+                    await progress("VMDR zoekt recente detecties · \(assets.count) Macs gevonden", nil)
+                    let page = try await assetSearch(
+                        session, resource: "hostinstancevuln",
+                        criteria: [("hostAssetId", batch.count == 1 ? "EQUALS" : "IN",
+                                    batch.map(String.init).joined(separator: ",")),
+                                   ("lastfound", "GREATER", formatter.string(from: cutoff)),
+                                   ("ignored", "EQUALS", "false"), ("disabled", "EQUALS", "false")],
+                        cursor: detectionCursor)
+                    detectionCursor = try page.nextCursor(after: detectionCursor)
+                    for item in try page.root.nodes(forXPath: "data/HostInstanceVuln") {
+                        guard let host = Self.field("hostAssetId", in: item).flatMap(Int.init),
+                              allowed.contains(host) else {
+                            rejected += 1
+                            continue
+                        }
+                        guard let qid = Self.field("qid", in: item).flatMap(Int.init), qid > 0,
+                              let date = Self.field("lastFound", in: item) ?? Self.field("lastfound", in: item),
+                              let seen = formatter.date(from: date) ?? fractional.date(from: date) else {
+                            throw Problem.response
+                        }
+                        guard seen >= cutoff else { continue }
+                        records[qid, default: []].append(QualysDetection(
+                            platform: .macOS, severity: nil, hostID: host, lastSeen: seen))
+                    }
+                    await progress("VMDR · \(records.count) recente QID’s vóór ernstfilter", nil)
+                } while detectionCursor != nil
+            }
+        } while assetCursor != nil
+
+        let findings = records.map { Self.detection(id: $0.key, records: $0.value) }
+        let details = try await enrich(findings, session: session) { message, partial in
+            progress(message, partial?.filter { $0.severity == .critical })
+        }
+        let critical = details.filter { $0.severity == .critical }
+        await progress("\(assets.count) bevestigde Macs · \(critical.count) kritieke QID’s", critical)
+        if rejected > 0 { throw Problem.tagScope(rejected, assets.count) }
+        return critical
+    }
+
+    private func assetSearch(_ session: URLSession, resource: String, fields: String? = nil,
+                             criteria: [(String, String, String)], cursor: Int?) async throws -> AssetPage {
+        try Task.checkCancellation()
+        var request = try makeRequest(path: "/qps/rest/2.0/search/am/" + resource, parameters: fields.map { ["fields": $0] } ?? [:])
+        request.httpMethod = "POST"
+        request.setValue("text/xml", forHTTPHeaderField: "Content-Type")
+        let root = XMLElement(name: "ServiceRequest")
+        let preferences = XMLElement(name: "preferences")
+        preferences.addChild(XMLElement(name: "limitResults", stringValue: "100"))
+        root.addChild(preferences)
+        let filters = XMLElement(name: "filters")
+        var allCriteria = criteria
+        if let cursor { allCriteria.append(("id", "GREATER", String(cursor))) }
+        for (field, op, value) in allCriteria {
+            let criterion = XMLElement(name: "Criteria", stringValue: value)
+            criterion.addAttribute(XMLNode.attribute(withName: "field", stringValue: field) as! XMLNode)
+            criterion.addAttribute(XMLNode.attribute(withName: "operator", stringValue: op) as! XMLNode)
+            filters.addChild(criterion)
+        }
+        root.addChild(filters)
+        request.httpBody = XMLDocument(rootElement: root).xmlData
+        let (data, response) = try await session.data(for: request)
+        try Self.validate(response, for: request)
+        let document = try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever])
+        guard let result = document.rootElement(), result.name == "ServiceResponse" else { throw Problem.response }
+        guard Self.field("responseCode", in: result) == "SUCCESS" else { throw Problem.assetSearch }
+        return AssetPage(root: result)
+    }
+
+    private struct AssetPage {
+        let root: XMLElement
+
+        func nextCursor(after previous: Int?) throws -> Int? {
+            guard QualysAPI.field("hasMoreRecords", in: root) == "true" else { return nil }
+            guard let next = QualysAPI.field("lastId", in: root).flatMap(Int.init), next > (previous ?? 0) else {
+                throw Problem.pagination
+            }
+            return next
+        }
+    }
+
+    private static func field(_ name: String, in node: XMLNode) -> String? {
+        (node as? XMLElement)?.elements(forName: name).first?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func enrich(_ findings: [Finding], session: URLSession,
+                        progress: @MainActor (String, [Finding]?) -> Void) async throws -> [Finding] {
+        var results = findings.sorted { $0.id < $1.id }
+        for start in stride(from: 0, to: results.count, by: 100) {
+            try Task.checkCancellation()
+            await progress("Titels, producten en CVE’s ophalen · \(start) van \(results.count) QID’s", results)
+            let end = min(start + 100, results.count)
+            let batch = start..<end
+            let ids = batch.map { String(results[$0].id) }.joined(separator: ",")
+            let request = try makeRequest(path: "/api/4.0/fo/knowledge_base/vuln/",
+                                          parameters: ["action": "list", "details": "Basic", "ids": ids])
+            let (data, response) = try await session.data(for: request)
+            try Self.validate(response, for: request)
+            let document = try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever])
+            guard let root = document.rootElement() else { throw Problem.response }
+            if let response = root.elements(forName: "RESPONSE").first,
+               let code = Self.field("CODE", in: response).flatMap(Int.init) { throw Problem.api(code) }
+            guard root.name == "KNOWLEDGE_BASE_VULN_LIST_OUTPUT",
+                  let response = root.elements(forName: "RESPONSE").first else { throw Problem.response }
+            guard response.elements(forName: "WARNING").isEmpty else { throw Problem.pagination }
+
+            let positions = Dictionary(uniqueKeysWithValues: batch.map { (results[$0].id, $0) })
+            for record in try response.nodes(forXPath: "VULN_LIST/VULN") {
+                guard let id = Self.field("QID", in: record).flatMap(Int.init),
+                      let index = positions[id] else { continue }
+                let products = try Self.values("SOFTWARE_LIST/SOFTWARE/PRODUCT", in: record)
+                let cves = try Self.values("CVE_LIST/CVE/ID", in: record)
+                let severity = Self.field("SEVERITY_LEVEL", in: record).flatMap(Int.init)
+                    .flatMap(Severity.init(rawValue:))
+                let title = Self.field("TITLE", in: record) ?? ""
+                results[index] = Finding(id: id, title: title.isEmpty ? "Titel niet beschikbaar" : title,
+                                         product: products.isEmpty ? "Onbekend" : products.joined(separator: ", "),
+                                         severity: severity, cves: cves, detections: results[index].detections)
             }
         }
         return results
+    }
+
+    private static func values(_ xpath: String, in node: XMLNode) throws -> [String] {
+        let values = try node.nodes(forXPath: xpath).compactMap {
+            $0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return Set(values.filter { !$0.isEmpty }).sorted()
     }
 
     private static func detection(id: Int, records: [QualysDetection]) -> Finding {
@@ -89,8 +188,7 @@ struct QualysAPI {
                 severity: nil, cves: [], detections: records)
     }
 
-    private func fetch(_ session: URLSession, path: String, parameters: [String: String],
-                       root: String) async throws -> QualysXML {
+    private func makeRequest(path: String, parameters: [String: String]) throws -> URLRequest {
         guard var parts = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
             throw Problem.configuration
         }
@@ -105,31 +203,44 @@ struct QualysAPI {
         request.setValue("Basic \(credential)", forHTTPHeaderField: "Authorization")
         request.setValue("Qualys Client", forHTTPHeaderField: "X-Requested-With")
         request.setValue("application/xml", forHTTPHeaderField: "Accept")
-        let (data, response) = try await session.data(for: request)
-        guard let status = (response as? HTTPURLResponse)?.statusCode else { throw Problem.response }
-        guard (200..<300).contains(status) else { throw Problem.http(status) }
+        return request
+    }
 
-        let output = QualysXML()
-        let parser = XMLParser(data: data)
-        parser.shouldResolveExternalEntities = false
-        parser.delegate = output
-        guard parser.parse() else { throw Problem.response }
-        if let code = output.errorCode { throw Problem.api(code) }
-        guard output.root == root, output.hasResponse else { throw Problem.response }
-        return output
+    private static func validate(_ response: URLResponse, for request: URLRequest) throws {
+        guard let status = (response as? HTTPURLResponse)?.statusCode else { throw Problem.response }
+        guard (200..<300).contains(status) else {
+            let endpoint = [request.url?.host, request.url?.path].compactMap { $0 }.joined()
+            let step: String
+            switch request.url?.lastPathComponent {
+            case "hostasset": step = "Apparaten zoeken"
+            case "hostinstancevuln": step = "Recente detecties zoeken"
+            default: step = "Titels en producten ophalen"
+            }
+            throw Problem.http(status, step, endpoint)
+        }
     }
 
     enum Problem: LocalizedError {
-        case configuration, response, pagination, http(Int), api(Int)
+        case configuration, response, pagination, assetSearch, http(Int, String, String), api(Int), tagScope(Int, Int)
         var errorDescription: String? {
             switch self {
-            case .configuration: "Vul de HTTPS-URL van de Qualys API, je inlognaam, wachtwoord en tag in."
-            case .response: "Onverwacht antwoord. Controleer of je de Qualys API-URL van je platform gebruikt."
-            case .pagination: "Qualys heeft een onvolledig antwoord gegeven. Ververs om opnieuw te proberen."
-            case .http(401), .http(403): "Toegang geweigerd. Controleer je inloggegevens en de VM/VMDR API-rechten."
-            case .http(429): "Qualys heeft de API-limiet bereikt. Probeer het later opnieuw."
-            case .http(let status): "Qualys API gaf HTTP \(status) terug."
-            case .api(let code): "Qualys API-fout \(code). Controleer je API-rechten en de naam van de tag."
+            case .assetSearch: return "VMDR Asset Management heeft de zoekaanvraag afgewezen."
+            case .configuration: return "Vul de HTTPS-URL van de Qualys API, je inlognaam, wachtwoord en tag in."
+            case .response: return "Onverwacht antwoord. Controleer of je de Qualys API-URL van je platform gebruikt."
+            case .pagination: return "Qualys heeft een onvolledig antwoord gegeven. Ververs om opnieuw te proberen."
+            case .tagScope(let rejected, let verified):
+                return "Tagcontrole: \(verified) apparaten in Host List bevestigd. \(rejected) hostrecords geweigerd wegens een afwijkend ID of ontbrekende tag. De getoonde resultaten kunnen onvolledig zijn."
+            case .http(let status, let step, let endpoint):
+                let detail: String
+                switch status {
+                case 401, 403: detail = "Controleer je inloggegevens en API-rechten."
+                case 404: detail = "Controleer de API Server URL van je Qualys-platform."
+                case 429: detail = "De API-limiet is bereikt. Probeer het later opnieuw."
+                default: detail = ""
+                }
+                return "\(step): HTTP \(status) van \(endpoint). \(detail)"
+
+            case .api(let code): return "Qualys API-fout \(code). Controleer je API-rechten en de naam van de tag."
             }
         }
     }
@@ -140,86 +251,5 @@ private final class NoRedirects: NSObject, URLSessionTaskDelegate {
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping (URLRequest?) -> Void) {
         completionHandler(nil)
-    }
-}
-
-private final class QualysXML: NSObject, XMLParserDelegate {
-    private var path: [String] = []
-    private var value = ""
-    private var id: Int?
-    private var severity: Int?
-    private var title = ""
-    private var platform = Platform.unknown
-    private var timesFound = 0
-    private var lastSeen: Date?
-    private let dateFormat = ISO8601DateFormatter()
-    private let fractionalDateFormat: ISO8601DateFormatter = {
-        let format = ISO8601DateFormatter()
-        format.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return format
-    }()
-    private var products: Set<String> = []
-    private var cves: Set<String> = []
-
-    private(set) var root: String?
-    private(set) var hasResponse = false
-    private(set) var errorCode: Int?
-    private(set) var hasWarning = false
-    private(set) var continuation: String?
-    private(set) var detections: [Int: [QualysDetection]] = [:]
-    private(set) var findings: [Int: Finding] = [:]
-
-    func parser(_ parser: XMLParser, didStartElement element: String, namespaceURI: String?,
-                qualifiedName: String?, attributes: [String: String]) {
-        if path.isEmpty { root = element }
-        if path.count == 1, element == "RESPONSE" { hasResponse = true }
-        path.append(element)
-        value = ""
-        if element == "HOST" { platform = .unknown }
-        if element == "DETECTION" || element == "VULN" {
-            id = nil
-            severity = nil
-            timesFound = 0
-            lastSeen = nil
-            title = ""
-            products.removeAll()
-            cves.removeAll()
-        }
-        if element == "WARNING" { hasWarning = true }
-    }
-
-    func parser(_ parser: XMLParser, foundCharacters string: String) { value += string }
-    func parser(_ parser: XMLParser, foundCDATA data: Data) { value += String(decoding: data, as: UTF8.self) }
-
-    func parser(_ parser: XMLParser, didEndElement element: String, namespaceURI: String?, qualifiedName: String?) {
-        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        _ = path.popLast()
-        switch (path.last, element) {
-        case ("DETECTION", "QID"), ("VULN", "QID"): id = Int(text)
-        case ("DETECTION", "SEVERITY"), ("VULN", "SEVERITY_LEVEL"): severity = Int(text)
-        case ("HOST", "OS"): platform = Platform(os: text)
-        case ("DETECTION", "TIMES_FOUND"): timesFound = max(0, Int(text) ?? 0)
-        case ("DETECTION", "LAST_FOUND_DATETIME"):
-            lastSeen = dateFormat.date(from: text) ?? fractionalDateFormat.date(from: text)
-        case ("VULN", "TITLE"): title = text
-        case ("SOFTWARE", "PRODUCT"): if !text.isEmpty { products.insert(text) }
-        case ("CVE", "ID"): if !text.isEmpty { cves.insert(text) }
-        case ("DETECTION_LIST", "DETECTION"):
-            if let id {
-                detections[id, default: []].append(QualysDetection(
-                    platform: platform, severity: severity.flatMap(Severity.init(rawValue:)),
-                    timesFound: timesFound, lastSeen: lastSeen))
-            }
-        case ("VULN_LIST", "VULN"):
-            if let id {
-                findings[id] = Finding(id: id, title: title.isEmpty ? "Titel niet beschikbaar" : title,
-                                       product: products.isEmpty ? "Onbekend" : products.sorted().joined(separator: ", "),
-                                       severity: severity.flatMap(Severity.init(rawValue:)), cves: cves.sorted())
-            }
-        case ("WARNING", "URL"): continuation = text
-        case ("RESPONSE", "CODE"): errorCode = Int(text)
-        default: break
-        }
-        value = ""
     }
 }

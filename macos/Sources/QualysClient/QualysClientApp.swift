@@ -21,31 +21,26 @@ struct QualysClientApp: App {
 struct CatalogView: View {
     let catalog: LiveCatalog
     @State private var query = ""
-    @State private var scope: Int? = Severity.critical.rawValue
-    @State private var platform: Platform? = .macOS
     @State private var days = 30
     @State private var scoped: [Finding] = []
     @State private var product = ""
     @State private var selection: Finding.ID? = nil
     @State private var showsInspector = true
-    @State private var sort = [KeyPathComparator(\Finding.timesFound, order: .reverse),
+    @State private var sort = [KeyPathComparator(\Finding.deviceCount, order: .reverse),
                                KeyPathComparator(\Finding.id)]
 
     private var findings: [Finding] { catalog.findings }
-    private var severity: Severity? { Severity(rawValue: scope ?? 0) }
     private var products: [String] {
         Set(scoped.map(\.product)).union(product.isEmpty ? [] : [product]).sorted()
     }
 
     private struct Scope: Equatable {
         let revision: Int
-        let severity: Severity?
-        let platform: Platform?
         let days: Int
     }
 
     private var currentScope: Scope {
-        Scope(revision: catalog.revision, severity: severity, platform: platform, days: days)
+        Scope(revision: catalog.revision, days: days)
     }
 
     private var filtered: [Finding] {
@@ -61,22 +56,10 @@ struct CatalogView: View {
     var body: some View {
         let rows = filtered
         NavigationSplitView {
-            List(selection: $scope) {
+            List {
                 Section("Catalogus") {
-                    Label("Alle QID’s", systemImage: "list.bullet.rectangle")
-                        .tag(0)
-                }
-                Section("Ernst") {
-                    ForEach(Severity.allCases.reversed()) { item in
-                        Label {
-                            Text(item.label)
-                        } icon: {
-                            Image(systemName: "circle.fill")
-                                .font(.system(size: 8))
-                                .foregroundStyle(item.color)
-                        }
-                        .tag(item.rawValue)
-                    }
+                    Label("Kritieke QID’s", systemImage: "list.bullet.rectangle")
+                    Label("macOS", systemImage: "laptopcomputer")
                 }
             }
             .listStyle(.sidebar)
@@ -134,7 +117,7 @@ struct CatalogView: View {
         }
         .onChange(of: currentScope, initial: true) { _, scope in
             let since = scope.days > 0 ? Calendar.current.date(byAdding: .day, value: -scope.days, to: .now) : nil
-            scoped = findings.compactMap { $0.scoped(platform: scope.platform, since: since, severity: scope.severity) }
+            scoped = findings.compactMap { $0.scoped(platform: .macOS, since: since, severity: .critical) }
         }
         .onChange(of: rows.map(\.id)) { _, ids in
             if let selection, !ids.contains(selection) {
@@ -146,24 +129,24 @@ struct CatalogView: View {
     private func catalogHeader(count: Int) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(severity?.title ?? "Alle QID’s")
+                Text("Kritieke QID’s")
                     .font(.system(size: 29, weight: .semibold))
                 Text("\(count) van \(findings.count) QID’s")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+                if !catalog.isLoading, catalog.failure == nil, catalog.tag != nil {
+                    Text(catalog.progress)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
             HStack {
-                Picker("Platform", selection: $platform) {
-                    Text("Alle").tag(nil as Platform?)
-                    ForEach(Platform.allCases) { Text($0.rawValue).tag(Optional($0)) }
-                }
-                .fixedSize()
                 Picker("Laatste gezien", selection: $days) {
-                    ForEach([7, 14, 30, 60, 90, 180, 365], id: \.self) { day in
+                    ForEach([7, 14, 30], id: \.self) { day in
                         Text("Laatste \(day) dagen").tag(day)
                     }
-                    Text("Alle datums").tag(0)
                 }
                 .fixedSize()
                 Picker("Product", selection: $product) {
@@ -183,6 +166,11 @@ struct CatalogView: View {
             if catalog.isLoading {
                 ProgressView().controlSize(.small)
                 Text(catalog.progress)
+                if let started = catalog.started {
+                    Text(started, style: .timer)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
                 Button("Stop", action: catalog.cancel)
             } else if let failure = catalog.failure {
                 Label(failure, systemImage: "exclamationmark.triangle")
@@ -216,7 +204,7 @@ struct CatalogView: View {
                 Button("Laad met bewaarde instellingen", action: catalog.refresh)
             }
         } else if findings.isEmpty {
-            ContentUnavailableView("Geen QID’s voor deze tag", systemImage: "list.bullet.rectangle")
+            ContentUnavailableView("Geen kritieke macOS-QID’s binnen 30 dagen", systemImage: "list.bullet.rectangle")
         } else {
             table(rows)
         }
@@ -233,8 +221,8 @@ struct CatalogView: View {
                 .width(min: 145, ideal: 310)
             TableColumn("Product", value: \.product)
                 .width(min: 70, ideal: 105, max: 180)
-            TableColumn("Keren gezien", value: \.timesFound) { finding in
-                Text(finding.timesFound, format: .number).monospacedDigit()
+            TableColumn("Macs", value: \.deviceCount) { finding in
+                Text(finding.deviceCount, format: .number).monospacedDigit()
             }
             .width(min: 84, ideal: 94, max: 130)
             TableColumn("Ernst", value: \.rank) { finding in
@@ -252,14 +240,13 @@ struct CatalogView: View {
         .overlay {
             if rows.isEmpty {
                 ContentUnavailableView {
-                    Label("Geen QID’s gevonden", systemImage: "magnifyingglass")
+                    Label(catalog.isLoading ? "Nog geen QID’s voor deze filters" : "Geen QID’s gevonden",
+                          systemImage: "magnifyingglass")
                 } actions: {
                     Button("Wis zoekopdracht en filters") {
                         query = ""
                         product = ""
-                        scope = 0
-                        platform = nil
-                        days = 0
+                        days = 30
                     }
                 }
             }
@@ -284,7 +271,7 @@ struct CatalogView: View {
                     Divider()
                     LabeledContent("Ernst", value: finding.severityLabel)
                     LabeledContent("Product", value: finding.product)
-                    LabeledContent("Keren gezien", value: finding.timesFound.formatted())
+                    LabeledContent("Macs", value: finding.deviceCount.formatted())
                     if let date = finding.lastSeen {
                         LabeledContent("Laatst gezien", value: date.formatted(date: .abbreviated, time: .omitted))
                     }

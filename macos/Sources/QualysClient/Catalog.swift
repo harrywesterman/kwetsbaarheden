@@ -8,7 +8,7 @@ struct Finding: Identifiable {
     let cves: [String]
 
     var detections: [QualysDetection] = []
-    var timesFound = 0
+    var deviceCount = 0
     var lastSeen: Date?
     var searchText: String { ([reference, title, product] + cves).joined(separator: " ") }
 
@@ -18,7 +18,7 @@ struct Finding: Identifiable {
 
     func scoped(platform: Platform?, since: Date?, severity: Severity?) -> Finding? {
         var result = self
-        result.timesFound = 0
+        var devices: Set<Int> = []
         result.lastSeen = nil
         var highestRank = 0
         var matched = false
@@ -29,13 +29,14 @@ struct Finding: Identifiable {
             if let since, !(detection.lastSeen.map { $0 >= since } ?? false) { continue }
             matched = true
             highestRank = max(highestRank, detectionSeverity?.rawValue ?? 0)
-            result.timesFound += detection.timesFound
+            devices.insert(detection.hostID)
             if let date = detection.lastSeen, date > (result.lastSeen ?? .distantPast) {
                 result.lastSeen = date
             }
         }
         guard matched else { return nil }
         result.severity = Severity(rawValue: highestRank)
+        result.deviceCount = devices.count
         return result
     }
 }
@@ -43,7 +44,7 @@ struct Finding: Identifiable {
 struct QualysDetection {
     let platform: Platform
     let severity: Severity?
-    let timesFound: Int
+    let hostID: Int
     let lastSeen: Date?
 }
 

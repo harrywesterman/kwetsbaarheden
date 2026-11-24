@@ -12,6 +12,7 @@ final class LiveCatalog {
     private(set) var failure: String?
     private(set) var isLoading = false
     private(set) var progress = ""
+    private(set) var started: Date?
     private var request: Task<Void, Never>?
 
     func loadOnce() {
@@ -48,14 +49,15 @@ final class LiveCatalog {
         if reset { findings = [] }
         tag = api.tag
         isLoading = true
+        started = .now
         failure = nil
         progress = "Verbinding maken met Qualys…"
         request = Task {
             do {
                 let result = try await api.findings { message, rows in
                     guard !Task.isCancelled else { return }
-                    progress = message
-                    if let rows { findings = rows }
+                    self.progress = message
+                    if let rows, !rows.isEmpty { self.findings = rows }
                 }
                 guard !Task.isCancelled else { return }
                 findings = result
